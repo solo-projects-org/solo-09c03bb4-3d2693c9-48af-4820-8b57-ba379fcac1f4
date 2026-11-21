@@ -62,10 +62,28 @@ class PreviewResult(BaseModel):
     end_date: str
     base_date: str
     basis_hash: str
+    prices_hash: str = Field(description="区间行情指纹，补录即变")
     basis: list[dict]
     points: list[AdjustedPoint]
     stale: bool
     note: str = ""
+
+
+class FactorPoint(BaseModel):
+    trade_date: str
+    factor: str = Field(description="折算因子（精确分数）")
+
+
+class RebaseResult(BaseModel):
+    """换对照日：只回核验信息（双指纹 + stale）与必要换算比例，不回行情。"""
+    start_date: str
+    end_date: str
+    base_date: str
+    basis_hash: str
+    prices_hash: str
+    stale: bool
+    note: str = ""
+    factors: list[FactorPoint]
 
 
 class LockInRequest(BaseModel):
@@ -73,6 +91,8 @@ class LockInRequest(BaseModel):
     end_date: str
     base_date: str
     basis_hash: str = Field(description="预览返回的依据指纹，须与现行公告一致")
+    prices_hash: str | None = Field(
+        default=None, description="预览返回的区间行情指纹，提供时须与底表一致")
 
     _v1 = field_validator("start_date")(_validate_date)
     _v2 = field_validator("end_date")(_validate_date)
@@ -82,6 +102,7 @@ class LockInRequest(BaseModel):
 class LockInResult(BaseModel):
     submission_id: str
     basis_hash: str
+    prices_hash: str
     points: list[AdjustedPoint]
 
 

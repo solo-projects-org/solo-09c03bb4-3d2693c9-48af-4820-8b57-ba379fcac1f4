@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>拆并股收盘价折算</title>
+<title>拆并股收盘价折算 · 双基准日对照</title>
 <style>
   :root { --bd:#d0d7de; --bg:#f6f8fa; --ok:#1a7f37; --warn:#9a6700; --err:#cf222e; }
   * { box-sizing: border-box; }
@@ -19,6 +19,7 @@
   button { background:#f6f8fa; cursor:pointer; }
   button.primary { background:#1f6feb; color:#fff; border-color:#1f6feb; }
   button:hover { filter:brightness(0.97); }
+  button:disabled { opacity:.5; cursor:not-allowed; }
   .row { display:flex; gap:10px; flex-wrap:wrap; align-items:end; }
   .field { display:flex; flex-direction:column; gap:3px; }
   .field label { font-size:12px; color:#57606a; }
@@ -26,6 +27,8 @@
   th, td { border:1px solid var(--bd); padding:5px 8px; text-align:right; }
   th:first-child, td:first-child { text-align:left; }
   thead th { background:var(--bg); position:sticky; top:0; }
+  .colA { background:#ddf4ff; }
+  .colB { background:#fff8c5; }
   .msg { margin-top:8px; padding:8px 10px; border-radius:6px; white-space:pre-wrap; font-size:13px; }
   .msg.ok { background:#dafbe1; color:var(--ok); }
   .msg.warn { background:#fff8c5; color:var(--warn); }
@@ -38,7 +41,7 @@
 </style>
 </head>
 <body>
-<header><h1>拆并股收盘价折算 · 统一股份口径（价格单位：分）</h1></header>
+<header><h1>拆并股收盘价折算 · 同一行情段双基准日并排对照（价格单位：分）</h1></header>
 <main>
 
 <section>
@@ -69,25 +72,33 @@
 </section>
 
 <section>
-  <h2>3. 选区间与基准交易日，预览折算序列</h2>
+  <h2>3. 选区间与两个基准交易日，并排对比预览</h2>
+  <p class="hint">首次预览一次性载入原价与精确折算依据（取自同一已提交状态）；之后换对照日只交换核验信息与必要换算比例，
+    网页复用已载入的原价按精确分数折算，最后才四舍五入到分。两个基准日都须是区间内有收盘价的日期。</p>
   <div class="row">
-    <div class="field"><label>区间起</label><input id="startDate" type="date"></div>
-    <div class="field"><label>区间止</label><input id="endDate" type="date"></div>
-    <div class="field"><label>基准交易日</label><input id="baseDate" type="date"></div>
-    <button class="primary" onclick="preview()">预览折算</button>
+    <div class="field"><label>区间起</label><input id="startDate" type="date" value="2026-01-05"></div>
+    <div class="field"><label>区间止</label><input id="endDate" type="date" value="2026-01-25"></div>
+    <div class="field"><label>基准交易日 A</label><input id="baseDateA" type="date" value="2026-01-25"></div>
+    <div class="field"><label>对照基准交易日 B</label><input id="baseDateB" type="date" value="2026-01-05"></div>
+    <button class="primary" onclick="previewCompare()">预览对比 / 刷新</button>
   </div>
   <div id="previewMeta"></div>
-  <div style="max-height:340px; overflow:auto">
-    <table id="previewTable" style="display:none"><thead><tr>
-      <th>交易日</th><th>原始收盘价(分)</th><th>折算因子</th><th>基准日口径收盘价(分)</th>
+  <div style="max-height:360px; overflow:auto">
+    <table id="compareTable" style="display:none"><thead><tr>
+      <th>交易日</th><th>原始收盘价(分)</th>
+      <th class="colA" id="headFactorA">A 因子</th><th class="colA" id="headAdjA">A 折算(分)</th>
+      <th class="colB" id="headFactorB">B 因子</th><th class="colB" id="headAdjB">B 折算(分)</th>
     </tr></thead><tbody></tbody></table>
+  </div>
+  <div class="row" style="margin-top:10px">
+    <button class="primary" id="lockA" onclick="lockIn('A')" disabled>以 A 列基准日送审</button>
+    <button class="primary" id="lockB" onclick="lockIn('B')" disabled>以 B 列基准日送审</button>
   </div>
 </section>
 
 <section>
-  <h2>4. 锁定送审 / 凭送审号重开</h2>
+  <h2>4. 送审结果 / 凭送审号重开</h2>
   <div class="row">
-    <button class="primary" onclick="lockIn()">锁定当前预览并取得送审号</button>
     <div class="field"><label>送审号</label><input id="subId" placeholder="SB-XXXX" style="width:240px"></div>
     <button onclick="reopen()">凭送审号重开（重现原序列）</button>
   </div>
@@ -101,7 +112,21 @@
 
 </main>
 <script>
-let currentBasisHash = null;
+// ------------------------------------------------------------ 页面状态
+// state.prices 为首次预览一次性载入的原价，换日复用，不重新拉取行情；
+// 每列只保存基准日与逐日精确因子（分数字符串），折算在网页端完成。
+const state = {
+  start: null, end: null,
+  prices: null,            // [{trade_date, close_cents}]
+  basisHash: null,         // 公告依据指纹（核验信息）
+  pricesHash: null,        // 区间行情指纹（核验信息，补录即变）
+  basis: [],
+  stale: false,
+  cols: {
+    A: { base: null, factors: null, seq: 0 },  // seq：连续换日以最后一次选择为准
+    B: { base: null, factors: null, seq: 0 },
+  },
+};
 
 function show(el, kind, text) {
   el.className = "msg " + kind;
@@ -112,11 +137,36 @@ async function api(path, opts) {
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
     const detail = typeof data.detail === "string" ? data.detail
+      : (data.detail && data.detail.message) ? data.detail.message
       : JSON.stringify(data.detail ?? data, null, 2);
-    throw new Error("HTTP " + res.status + "：" + detail);
+    const err = new Error("HTTP " + res.status + "：" + detail);
+    err.status = res.status;
+    err.data = data;
+    throw err;
   }
   return data;
 }
+
+// ------------------------------------------------------------ 精确折算（BigInt）
+// 因子为精确分数字符串 "n/d"（或整数 "4"），与原价相乘后最后才四舍五入到分：
+// round_half_up(p*n/d) = floor((2*p*n + d) / (2*d))（全部非负，整数运算无浮点误差）。
+function parseFactor(s) {
+  const i = s.indexOf("/");
+  return i < 0 ? [BigInt(s), 1n] : [BigInt(s.slice(0, i)), BigInt(s.slice(i + 1))];
+}
+function adjustCents(closeCents, factorStr) {
+  const [n, d] = parseFactor(factorStr);
+  const p = BigInt(closeCents);
+  return Number((2n * p * n + d) / (2n * d));
+}
+function factorOf(col, tradeDate) {
+  const f = state.cols[col].factors;
+  if (!f) return null;
+  const row = f.find(r => r.trade_date === tradeDate);
+  return row ? row.factor : null;
+}
+
+// ------------------------------------------------------------ 导入
 function parseLines(text) {
   const out = [];
   for (const raw of text.split(/\r?\n/)) {
@@ -170,7 +220,130 @@ async function loadAnns() {
   }
   tbl.style.display = "table";
 }
-function renderTable(tbl, points) {
+
+// ------------------------------------------------------------ 对比预览
+function renderMeta() {
+  const el = document.getElementById("previewMeta");
+  const basis = state.basis.map(b => `${b.ann_no}(r${b.revision}, ${b.effective_date}, ${b.old_shares}→${b.new_shares})`).join("；") || "无";
+  el.className = "msg " + (state.stale ? "warn" : "ok");
+  el.innerHTML = `依据指纹 <code>${state.basisHash.slice(0, 16)}…</code>　行情指纹 <code>${state.pricesHash.slice(0, 16)}…</code>　`
+    + (state.stale
+      ? `<span class="pill warn">须刷新</span> 区间内补录了行情或现行公告有变，请点“预览对比 / 刷新”重新载入后再送审`
+      : `<span class="pill ok">现行</span>`)
+    + `<br>参与折算公告：${basis}`;
+}
+function renderCompare() {
+  const tbl = document.getElementById("compareTable");
+  if (!state.prices) { tbl.style.display = "none"; return; }
+  document.getElementById("headFactorA").textContent = `A 因子 (基准 ${state.cols.A.base})`;
+  document.getElementById("headAdjA").textContent = `A 折算(分)`;
+  document.getElementById("headFactorB").textContent = `B 因子 (基准 ${state.cols.B.base})`;
+  document.getElementById("headAdjB").textContent = `B 折算(分)`;
+  const tb = tbl.querySelector("tbody");
+  tb.innerHTML = "";
+  for (const p of state.prices) {
+    const fa = factorOf("A", p.trade_date), fb = factorOf("B", p.trade_date);
+    tb.innerHTML += `<tr><td>${p.trade_date}</td><td>${p.close_cents}</td>`
+      + `<td class="colA">${fa ?? "—"}</td><td class="colA">${fa ? adjustCents(p.close_cents, fa) : "—"}</td>`
+      + `<td class="colB">${fb ?? "—"}</td><td class="colB">${fb ? adjustCents(p.close_cents, fb) : "—"}</td></tr>`;
+  }
+  tbl.style.display = "table";
+}
+function updateLockButtons() {
+  const ready = state.prices && !state.stale;
+  document.getElementById("lockA").disabled = !(ready && state.cols.A.factors);
+  document.getElementById("lockB").disabled = !(ready && state.cols.B.factors);
+}
+function markStale(note) {
+  state.stale = true;
+  renderMeta();
+  updateLockButtons();
+  const el = document.getElementById("previewMeta");
+  el.className = "msg warn";
+  el.innerHTML += `<br>⚠ ${note || "区间内补录了行情或现行公告有变"}，本预览不可送审，请刷新。`;
+}
+
+// 首次预览：原价与公告依据取自同一已提交状态（服务端同事务快照读取）。
+async function previewCompare() {
+  const el = document.getElementById("previewMeta");
+  const start = document.getElementById("startDate").value;
+  const end = document.getElementById("endDate").value;
+  const baseA = document.getElementById("baseDateA").value;
+  const baseB = document.getElementById("baseDateB").value;
+  try {
+    const params = new URLSearchParams({ start_date: start, end_date: end, base_date: baseA });
+    const r = await api("/api/adjustments/preview?" + params);
+    state.start = start; state.end = end;
+    state.prices = r.points.map(p => ({ trade_date: p.trade_date, close_cents: p.close_cents }));
+    state.basisHash = r.basis_hash;
+    state.pricesHash = r.prices_hash;
+    state.basis = r.basis;
+    state.stale = false;
+    state.cols.A.base = baseA;
+    state.cols.A.factors = r.points.map(p => ({ trade_date: p.trade_date, factor: p.factor }));
+    state.cols.B.base = null; state.cols.B.factors = null;
+    renderMeta(); renderCompare();
+    // 对照列 B：走换日通道，只取回核验信息与换算比例
+    await switchBase("B", baseB);
+  } catch (e) { show(el, "err", e.message); }
+}
+
+// 换对照日：只交换核验信息（双指纹）与必要换算比例；连续换日以最后一次选择为准。
+async function switchBase(col, base) {
+  const c = state.cols[col];
+  c.base = base;
+  const seq = ++c.seq;
+  const params = new URLSearchParams({
+    start_date: state.start, end_date: state.end, base_date: base,
+    basis_hash: state.basisHash, prices_hash: state.pricesHash,
+  });
+  try {
+    const r = await api("/api/adjustments/rebase?" + params);
+    if (seq !== c.seq) return;                 // 已有更新的选择，丢弃本次响应
+    if (r.start_date !== state.start || r.end_date !== state.end) return;  // 区间已改
+    if (r.stale) { markStale(r.note); return; }
+    c.factors = r.factors;
+    renderCompare();
+    updateLockButtons();
+  } catch (e) {
+    if (seq !== c.seq) return;
+    c.factors = null;
+    renderCompare();
+    updateLockButtons();
+    show(document.getElementById("previewMeta"), "err", `基准日 ${base} 不可用：${e.message}`);
+  }
+}
+
+// ------------------------------------------------------------ 送审（两列共用原入口）
+async function lockIn(col) {
+  const el = document.getElementById("subMsg");
+  if (state.stale) { show(el, "warn", "预览已过期：区间内补录了行情或现行公告有变，请刷新后再送审。"); return; }
+  const c = state.cols[col];
+  try {
+    const r = await api("/api/submissions", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        start_date: state.start, end_date: state.end, base_date: c.base,
+        basis_hash: state.basisHash, prices_hash: state.pricesHash,
+      })
+    });
+    document.getElementById("subId").value = r.submission_id;
+    // 核验：锁定返回的序列须与所选列（网页端精确折算结果）逐点一致
+    const mismatch = r.points.find(pt =>
+      pt.adjusted_cents !== adjustCents(
+        state.prices.find(p => p.trade_date === pt.trade_date).close_cents,
+        factorOf(col, pt.trade_date)));
+    show(el, mismatch ? "err" : "ok",
+      `已锁定 ${col} 列（基准日 ${c.base}），送审号：${r.submission_id}\n`
+      + (mismatch ? `⚠ 返回序列与所选列不一致：${mismatch.trade_date}` : "返回序列与所选列逐点一致。"));
+    renderSubTable(r.points);
+  } catch (e) {
+    if (e.status === 409) { markStale(e.message); show(el, "warn", e.message + "\n请刷新后重新送审。"); }
+    else show(el, "err", e.message);
+  }
+}
+function renderSubTable(points) {
+  const tbl = document.getElementById("subTable");
   const tb = tbl.querySelector("tbody");
   tb.innerHTML = "";
   for (const p of points) {
@@ -179,42 +352,6 @@ function renderTable(tbl, points) {
   }
   tbl.style.display = "table";
 }
-async function preview() {
-  const el = document.getElementById("previewMeta");
-  const params = new URLSearchParams({
-    start_date: document.getElementById("startDate").value,
-    end_date: document.getElementById("endDate").value,
-    base_date: document.getElementById("baseDate").value,
-  });
-  if (currentBasisHash) params.set("basis_hash", currentBasisHash);
-  try {
-    const r = await api("/api/adjustments/preview?" + params);
-    currentBasisHash = r.basis_hash;
-    const basis = r.basis.map(b => `${b.ann_no}(r${b.revision}, ${b.effective_date}, ${b.old_shares}→${b.new_shares})`).join("；") || "无";
-    el.className = "msg " + (r.stale ? "warn" : "ok");
-    el.innerHTML = `依据指纹 <code>${r.basis_hash.slice(0, 16)}…</code>　`
-      + (r.stale ? `<span class="pill warn">须刷新</span> ${r.note}` : `<span class="pill ok">现行</span>`)
-      + `<br>参与折算公告：${basis}`;
-    renderTable(document.getElementById("previewTable"), r.points);
-  } catch (e) { show(el, "err", e.message); }
-}
-async function lockIn() {
-  const el = document.getElementById("subMsg");
-  try {
-    const r = await api("/api/submissions", {
-      method: "POST", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({
-        start_date: document.getElementById("startDate").value,
-        end_date: document.getElementById("endDate").value,
-        base_date: document.getElementById("baseDate").value,
-        basis_hash: currentBasisHash,
-      })
-    });
-    document.getElementById("subId").value = r.submission_id;
-    show(el, "ok", `已锁定，送审号：${r.submission_id}\n依据指纹：${r.basis_hash}`);
-    renderTable(document.getElementById("subTable"), r.points);
-  } catch (e) { show(el, "err", e.message); }
-}
 async function reopen() {
   const el = document.getElementById("subMsg");
   const id = document.getElementById("subId").value.trim();
@@ -222,9 +359,17 @@ async function reopen() {
     const r = await api("/api/submissions/" + encodeURIComponent(id));
     el.className = "msg " + (r.stale ? "warn" : "ok");
     el.textContent = `${r.note}\n送审依据指纹：${r.basis_hash.slice(0,16)}… / 现行：${r.current_basis_hash.slice(0,16)}…`;
-    renderTable(document.getElementById("subTable"), r.points);
+    renderSubTable(r.points);
   } catch (e) { show(el, "err", e.message); }
 }
+
+// ------------------------------------------------------------ 事件绑定
+document.getElementById("baseDateA").addEventListener("change", e => {
+  if (state.prices && e.target.value && e.target.value !== state.cols.A.base) switchBase("A", e.target.value);
+});
+document.getElementById("baseDateB").addEventListener("change", e => {
+  if (state.prices && e.target.value && e.target.value !== state.cols.B.base) switchBase("B", e.target.value);
+});
 loadAnns();
 </script>
 </body>

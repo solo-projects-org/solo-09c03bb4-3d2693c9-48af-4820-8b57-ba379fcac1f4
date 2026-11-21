@@ -75,6 +75,18 @@ def basis_hash_of(anns: list[dict]) -> str:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
+def prices_hash_of(prices: list[dict]) -> str:
+    """区间行情指纹：对 [(trade_date, close_cents), ...] 规范 JSON 取 sha256。
+
+    底表只增不改不删，区间内补录新交易日即改变指纹，用于换日/送审时
+    发现“区间内补录了行情”。
+    """
+    payload = [[p["trade_date"], int(p["close_cents"])] for p in prices]
+    payload.sort(key=lambda x: x[0])
+    blob = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
 def relevant_events(start_date: str, end_date: str, base_date: str,
                     anns: list[dict]) -> list[dict]:
     """筛选重算所需公告：生效日落在 (start, max(end, base)] 半开区间内。
@@ -89,6 +101,19 @@ def relevant_events(start_date: str, end_date: str, base_date: str,
             out.append(canonical_announcement(a))
     out.sort(key=lambda x: (x["effective_date"], x["ann_no"]))
     return out
+
+
+def series_factors(prices: list[dict], base_date: str,
+                   events: list[dict]) -> list[dict]:
+    """逐交易日折算因子（精确分数字符串），供“换对照日”轻量返回。
+
+    只含换算比例，不含行情本身；网页用已载入的原价复算。
+    """
+    return [
+        {"trade_date": p["trade_date"],
+         "factor": str(factor_for_date(p["trade_date"], base_date, events))}
+        for p in prices
+    ]
 
 
 def build_series(prices: list[dict], base_date: str,

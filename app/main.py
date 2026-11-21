@@ -19,13 +19,16 @@ from app.models import (
     PreviewResult,
     PriceImportResult,
     PriceIn,
+    RebaseResult,
     ReopenResult,
 )
 from app.services import (
     basis_hash_of,
     body_hash_of,
     build_series,
+    prices_hash_of,
     relevant_events,
+    series_factors,
 )
 
 
@@ -239,49 +242,103 @@ def _validate_window(conn, start_date: str, end_date: str, base_date: str) -> No
                             detail="所选区间内没有任何行情数据")
 
 
+def _stale_note(basis_changed: bool, prices_changed: bool) -> str:
+    parts = []
+    if prices_changed:
+        parts.append("区间内行情有补录")
+    if basis_changed:
+        parts.append("现行公告已变更")
+    return "；".join(parts) + "，须刷新后再送审"
+
+
 def _preview(conn, start_date: str, end_date: str, base_date: str,
-             client_basis_hash: str | None) -> PreviewResult:
+             client_basis_hash: str | None,
+             client_prices_hash: str | None = None) -> PreviewResult:
+    # 显式事务：公告与行情取自同一已提交状态（快照一致），
+    # 送审路径的后续写入也加入同一事务，校验与落库原子完成。
+    conn.execute("BEGIN")
     _validate_window(conn, start_date, end_date, base_date)
     anns = _current_announcements(conn)
     current_hash = basis_hash_of(anns)
     events = relevant_events(start_date, end_date, base_date, anns)
     prices = _load_prices(conn, start_date, end_date)
+    current_prices_hash = prices_hash_of(prices)
     points = build_series(prices, base_date, events)
-    stale = client_basis_hash is not None and client_basis_hash != current_hash
-    note = ""
-    if stale:
-        note = "现行公告与预览所据依据不同，须刷新后再锁定"
+    basis_changed = client_basis_hash is not None and client_basis_hash != current_hash
+    prices_changed = (client_prices_hash is not None
+                      and client_prices_hash != current_prices_hash)
+    stale = basis_changed or prices_changed
     return PreviewResult(
         start_date=start_date,
         end_date=end_date,
         base_date=base_date,
         basis_hash=current_hash,
+        prices_hash=current_prices_hash,
         basis=events,
         points=points,
         stale=stale,
-        note=note,
+        note=_stale_note(basis_changed, prices_changed) if stale else "",
     )
 
 
 @app.get("/api/adjustments/preview", response_model=PreviewResult)
 def preview(start_date: str, end_date: str, base_date: str,
-            basis_hash: str | None = None):
-    """区间折算预览。可带预览时拿到的 basis_hash，用于检测现行公告是否已变更。"""
+            basis_hash: str | None = None, prices_hash: str | None = None):
+    """区间折算预览。可带上次拿到的 basis_hash / prices_hash，检测公告或行情是否已变。"""
     with db_cursor() as conn:
-        return _preview(conn, start_date, end_date, base_date, basis_hash)
+        return _preview(conn, start_date, end_date, base_date,
+                        basis_hash, prices_hash)
+
+
+@app.get("/api/adjustments/rebase", response_model=RebaseResult)
+def rebase(start_date: str, end_date: str, base_date: str,
+           basis_hash: str | None = None, prices_hash: str | None = None):
+    """换对照基准日：只回核验信息（双指纹 + stale）与逐日换算比例。
+
+    不回行情与折算结果——网页复用已载入的原价与精确因子自行折算，
+    最后才四舍五入到分。新基准日同样须是区间内有收盘价的日期。
+    """
+    with db_cursor() as conn:
+        conn.execute("BEGIN")  # 与首次预览同一快照口径
+        _validate_window(conn, start_date, end_date, base_date)
+        anns = _current_announcements(conn)
+        current_hash = basis_hash_of(anns)
+        prices = _load_prices(conn, start_date, end_date)
+        current_prices_hash = prices_hash_of(prices)
+        events = relevant_events(start_date, end_date, base_date, anns)
+        basis_changed = basis_hash is not None and basis_hash != current_hash
+        prices_changed = (prices_hash is not None
+                          and prices_hash != current_prices_hash)
+        stale = basis_changed or prices_changed
+        return RebaseResult(
+            start_date=start_date,
+            end_date=end_date,
+            base_date=base_date,
+            basis_hash=current_hash,
+            prices_hash=current_prices_hash,
+            stale=stale,
+            note=_stale_note(basis_changed, prices_changed) if stale else "",
+            factors=series_factors(prices, base_date, events),
+        )
 
 
 @app.post("/api/submissions", response_model=LockInResult)
 def lock_submission(req: LockInRequest):
-    """锁定预览并取得送审号；依据与现行公告不一致（stale）时拒绝，须先刷新。"""
+    """锁定预览并取得送审号。
+
+    依据指纹与现行公告不一致、或区间行情指纹与底表不一致（区间内补录）
+    时 409 拒绝，须先刷新。两列基准日共用本入口，返回序列按所送基准日
+    重算，与所选列一致。
+    """
     with db_cursor() as conn:
         preview_data = _preview(conn, req.start_date, req.end_date,
-                                req.base_date, req.basis_hash)
+                                req.base_date, req.basis_hash, req.prices_hash)
         if preview_data.stale:
             raise HTTPException(
                 status_code=409,
                 detail={"message": preview_data.note,
-                        "current_basis_hash": preview_data.basis_hash},
+                        "current_basis_hash": preview_data.basis_hash,
+                        "current_prices_hash": preview_data.prices_hash},
             )
         submission_id = "SB-" + uuid.uuid4().hex[:16].upper()
         conn.execute(
@@ -300,6 +357,7 @@ def lock_submission(req: LockInRequest):
             )
         return LockInResult(submission_id=submission_id,
                             basis_hash=preview_data.basis_hash,
+                            prices_hash=preview_data.prices_hash,
                             points=preview_data.points)
 
 
